@@ -14,6 +14,7 @@ from typing import Any, Concatenate, ParamSpec, TypeVar
 from httpx import AsyncClient, HTTPError, Response
 from httpx_sse import ServerSentEvent, aconnect_sse
 from jupyterhub.spawner import Spawner
+from safir.asyncio import AsyncMultiQueue
 from traitlets import Unicode, default
 
 from .exceptions import (
@@ -186,11 +187,7 @@ class RSPRestSpawner(Spawner):
         super().__init__(*args, **kwargs)
 
         # Holds the events from a spawn in progress.
-        self._events: list[SpawnEvent] = []
-
-        # Triggers used to notify listeners of new events. Each listener gets
-        # its own trigger.
-        self._triggers: list[asyncio.Event] = []
+        self._events = AsyncMultiQueue[SpawnEvent]()
 
         # Holds the future representing a spawn in progress, used by the
         # progress method to know when th spawn is finished and it should
@@ -320,7 +317,7 @@ class RSPRestSpawner(Spawner):
 
         Yields
         ------
-        dict of str to str or int
+        dict of str or int
             Dictionary representing the event with fields ``progress``,
             containing an integer completion percentage, and ``message``,
             containing a human-readable description of the event.
@@ -335,53 +332,21 @@ class RSPRestSpawner(Spawner):
         Uses the internal ``_start_future`` attribute to track when the
         related `start` method has completed.
         """
-        next_event = 0
-        complete = False
-
-        # Insert a trigger into the trigger list that will be notified by the
-        # in-progress spawn.
-        trigger = asyncio.Event()
-        self._triggers.append(trigger)
-
-        # Capture the current future and event stream in a local variable so
-        # that we consistently monitor the same invocation of start. If that
-        # one aborts and someone kicks off another one, we want to keep
-        # following the first one until it completes, not switch streams to
-        # the second one.
-        start_future = self._start_future
-        events = self._events
-
         # We were apparently called before start was called, so there's
         # nothing to report.
-        if not start_future:
+        if not self._start_future:
             return
 
-        while not complete:
-            trigger.clear()
-            if start_future.done():
-                # Indicate that we're done, but continue to execute the rest
-                # of the loop. We want to process any events received before
-                # the spawner finishes and report them before ending the
-                # stream.
-                complete = True
-
-            # This logic tries to ensure that we don't repeat events even
-            # though start will be adding more events while we're working.
-            len_events = len(events)
-            for i in range(next_event, len_events):
-                yield events[i].to_dict()
-            next_event = len_events
-
-            # Wait until we're notified that there are new events or we time
-            # out on the spawn. This is not the correct timeout (start_timeout
-            # is a bound on the total time, not each event). It's just an
-            # arbitrary timeout to ensure we don't wait forever, which is
-            # guaranteed to be longer than a spawn can take.
-            if not complete:
-                try:
-                    await asyncio.wait_for(trigger.wait(), self.start_timeout)
-                except TimeoutError:
-                    complete = True
+        # Iterate over the spawn events until complete. start_timeout is
+        # really enforced on the whole spawn process, but it's guaranteed to
+        # be longer than a spawn can take, so it ensures we don't wait
+        # forever if something goes wrong.
+        timeout = timedelta(seconds=self.start_timeout)
+        try:
+            async for event in self._events.aiter_from(0, timeout):
+                yield event.to_dict()
+        except TimeoutError:
+            pass
 
     def start(self) -> asyncio.Task[str]:
         """Start the user's pod.
@@ -459,14 +424,7 @@ class RSPRestSpawner(Spawner):
         to not be running at the same time, so we ignore that possibility.
         """
         progress = 0
-
-        # Clear the event list (by replacing the previous list so that any
-        # running progress calls see the old list, not the new one), and
-        # notify any existing triggers and then clear the trigger list.
-        self._events = []
-        for trigger in self._triggers:
-            trigger.set()
-        self._triggers = []
+        self._events.clear()
 
         # Ask the Nublado lab controller to do the spawn and monitor its
         # progress until complete.
@@ -484,7 +442,7 @@ class RSPRestSpawner(Spawner):
                     message="Deleting existing orphaned lab",
                     severity="warning",
                 )
-                self._events.append(event)
+                self._events.put(event)
                 await self.stop()
                 r = await self._create_lab()
 
@@ -501,7 +459,7 @@ class RSPRestSpawner(Spawner):
                 event = SpawnEvent.from_sse(sse, progress)
                 if event.progress:
                     progress = event.progress
-                self._events.append(event)
+                self._events.put(event)
                 if event.complete:
                     break
                 if event.failed:
@@ -511,10 +469,9 @@ class RSPRestSpawner(Spawner):
             return await self._get_internal_url()
 
         finally:
-            # Ensure that we set all the triggers just before we exit so that
-            # none of the progress calls will get stranded waiting for a lock.
-            for trigger in self._triggers:
-                trigger.set()
+            # Mark the event queue as complete, which will cause all watchers
+            # to reach the ends of their iterators.
+            self._events.close()
 
     @_convert_exception
     async def stop(self) -> None:

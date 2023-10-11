@@ -78,7 +78,7 @@ async def test_options_form(spawner: RSPRestSpawner) -> None:
 
 @pytest.mark.asyncio
 async def test_progress(spawner: RSPRestSpawner) -> None:
-    await spawner.start()
+    results = await asyncio.gather(spawner.start(), collect_progress(spawner))
     user = spawner.user.name
     expected = [
         {"progress": 2, "message": "[info] Lab creation initiated"},
@@ -88,11 +88,11 @@ async def test_progress(spawner: RSPRestSpawner) -> None:
             "message": f"[info] Pod successfully spawned for {user}",
         },
     ]
-    index = 0
-    async for message in spawner.progress():
-        assert message == expected[index]
-        index += 1
-    assert index == len(expected)
+    assert results[1] == expected
+
+    # A new reader should be able to come along after the lab has spawned and
+    # see the same progress messages with no waiting.
+    assert await collect_progress(spawner) == expected
 
 
 @pytest.mark.asyncio
@@ -100,7 +100,7 @@ async def test_progress_conflict(spawner: RSPRestSpawner) -> None:
     await spawner.start()
 
     # Start it a second time, which should trigger deleting the old lab.
-    await spawner.start()
+    results = await asyncio.gather(spawner.start(), collect_progress(spawner))
     user = spawner.user.name
     expected = [
         {"progress": 1, "message": "[warning] Deleting existing orphaned lab"},
@@ -111,11 +111,7 @@ async def test_progress_conflict(spawner: RSPRestSpawner) -> None:
             "message": f"[info] Pod successfully spawned for {user}",
         },
     ]
-    index = 0
-    async for message in spawner.progress():
-        assert message == expected[index]
-        index += 1
-    assert index == len(expected)
+    assert results[1] == expected
 
 
 @pytest.mark.asyncio

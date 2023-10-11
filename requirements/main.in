@@ -15,6 +15,7 @@ jupyterhub==3.1.1
 httpx
 httpx-sse
 PyYAML
+safir>=4.5.0
 traitlets
 
 # Additional dependencies required by our configuration of JupyterHub.
@@ -31,3 +32,7 @@ kubernetes_asyncio
 # JupyterHub image currently uses.
 exceptiongroup
 ruamel.yaml.clib
+
+# Uncomment this, change the branch, comment out safir above, and run make
+# update-deps-no-hashes to test against an unreleased version of Safir.
+# safir @ git+https://github.com/lsst-sqre/safir@main
